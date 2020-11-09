@@ -1,0 +1,282 @@
+# Service configurations for all microservices
+# has to be specified by environment files
+
+version: '3.7'
+
+volumes:
+  volume_adapter_db:
+    driver: local
+  volume_storage_db:
+    driver: local
+  volume_pipeline_db:
+    driver: local
+  volume_notification_db:
+    driver: local
+
+services:
+
+  # ----------------- UI SERVICE (/ui) --------------------
+  ui:
+    image: docker.pkg.github.com/jvalue/open-data-service/ui:latest
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.to-ui.rule=PathPrefix(`/`)"
+      - "traefik.http.services.ui.loadbalancer.server.port=80"
+
+  # ----------------- ADAPTER SERVICE (/adapter) --------------------
+  adapter:
+    image: docker.pkg.github.com/jvalue/open-data-service/adapter:latest
+    depends_on:
+      - adapter-db
+    environment:
+      DB_URL: jdbc:postgresql://adapter-db:5432/adapterservice
+      RABBIT_HOST: rabbitmq
+      RABBIT_USR: rabbit_adm
+      RABBIT_PWD: R4bb!7_4DM_p4SS
+      RABBIT_PORT: 5672
+      AMQP_EXCHANGE: 'ods_global'
+      AMQP_IMPORT_SUCCESS_TOPIC: 'datasource.execution.success'
+      AMQP_IMPORT_FAILED_TOPIC: 'datasource.execution.failed'
+      AMQP_DATASOURCE_CREATED_TOPIC: 'datasource.config.created'
+      AMQP_DATASOURCE_UPDATED_TOPIC: 'datasource.config.updated'
+      AMQP_DATASOURCE_DELETED_TOPIC: 'datasource.config.deleted'
+      AMQP_PUBLISH_RETRIES: 5
+      AMQP_PUBLISH_BACKOFF: 1000
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.to-adapter.rule=PathPrefix(`/api/adapter`)"
+      - "traefik.http.routers.to-adapter.middlewares=adapter-stripprefix@docker"
+      - "traefik.http.middlewares.adapter-stripprefix.stripprefix.prefixes=/api/adapter"
+      - "traefik.http.services.adapter.loadbalancer.server.port=8080"
+
+  adapter-db:
+    image: postgres
+    environment:
+      - POSTGRES_USER=adapterservice
+      - POSTGRES_PASSWORD=admin
+    volumes:
+      - volume_adapter_db:/var/lib/postgresql/data
+
+  # ----------------- SCHEDULER SERVICE (/scheduler) --------------------
+  scheduler:
+    image: docker.pkg.github.com/jvalue/open-data-service/scheduler:latest
+    environment:
+      MAX_TRIGGER_RETRIES: 2
+      ADAPTER_SERVICE_URL: http://adapter:8080
+      CONNECTION_RETRIES: 20
+      CONNECTION_BACKOFF_IN_MS: 5000
+
+      AMQP_URL: 'amqp://rabbit_adm:R4bb!7_4DM_p4SS@rabbitmq:5672'
+      AMQP_SCHEDULER_EXCHANGE: 'ods_global'
+      AMQP_SCHEDULER_QUEUE: 'scheduler.datasource-config'
+      AMQP_DATASOURCE_CONFIG_TOPIC: 'datasource.config.*'
+      AMQP_DATASOURCE_CONFIG_CREATED_TOPIC: 'datasource.config.created'
+      AMQP_DATASOURCE_CONFIG_UPDATED_TOPIC: 'datasource.config.updated'
+      AMQP_DATASOURCE_CONFIG_DELETED_TOPIC: 'datasource.config.deleted'
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.to-scheduler.rule=PathPrefix(`/api/scheduler`)"
+      - "traefik.http.routers.to-scheduler.middlewares=scheduler-stripprefix@docker"
+      - "traefik.http.middlewares.scheduler-stripprefix.stripprefix.prefixes=/api/scheduler"
+    depends_on:
+      - rabbitmq
+  # ----------------- STORAGE SERVICE (/storage) --------------------
+
+  storage-mq:
+    image: docker.pkg.github.com/jvalue/open-data-service/storage-mq:latest
+    environment:
+      CONNECTION_RETRIES: 30
+      CONNECTION_BACKOFF_IN_MS: 2000
+
+      POSTGRES_HOST: storage-db
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ods
+      POSTGRES_USER: storagemq
+      POSTGRES_PW: storagemq-pw
+      POSTGRES_SCHEMA: 'storage'
+
+      AMQP_URL: 'amqp://rabbit_adm:R4bb!7_4DM_p4SS@rabbitmq:5672'
+
+      AMQP_PIPELINE_CONFIG_EXCHANGE: 'ods_global'
+      AMQP_PIPELINE_CONFIG_QUEUE: 'storage-mq.pipeline-config'
+      AMQP_PIPELINE_CONFIG_TOPIC: 'pipeline.config.*'
+      AMQP_PIPELINE_CONFIG_CREATED_TOPIC: 'pipeline.config.created'
+      AMQP_PIPELINE_CONFIG_DELETED_TOPIC: 'pipeline.config.deleted'
+
+      AMQP_PIPELINE_EXECUTION_EXCHANGE: 'ods_global'
+      AMQP_PIPELINE_EXECUTION_QUEUE: 'storage-mq.pipeline-execution'
+      AMQP_PIPELINE_EXECUTION_TOPIC: 'pipeline.execution.*'
+      AMQP_PIPELINE_EXECUTION_SUCCESS_TOPIC: 'pipeline.execution.success'
+    depends_on:
+      - storage-db
+      - storage-db-liquibase # TODO: make sure the migration runs through before reading db structure
+      - rabbitmq
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.to-storage-mq.rule=PathPrefix(`/api/storage-mq`)"
+      - "traefik.http.routers.to-storage-mq.middlewares=storage-mq-stripprefix@docker"
+      - "traefik.http.middlewares.storage-mq-stripprefix.stripprefix.prefixes=/api/storage-mq"
+      - "traefik.http.services.storage-mq.loadbalancer.server.port=8080"
+
+  storage: # Wraps postgres database with API
+    image: docker.pkg.github.com/jvalue/open-data-service/storage:latest
+    environment:
+      DATABASE_HOST: storage-db
+      DATABASE_PORT: 5432
+      DATABASE_NAME: ods
+      DATABASE_USER: postgrest
+      DATABASE_PW: postgres-wrapper-pw
+      DATABASE_ANON: web_anon
+    depends_on:
+      - storage-db
+      - storage-db-liquibase # TODO: make sure the migration runs through before reading db structure
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.to-storage.rule=PathPrefix(`/api/storage`)"
+      - "traefik.http.routers.to-storage.middlewares=storage-stripprefix@docker,storage-addaccept@docker"
+      - "traefik.http.middlewares.storage-stripprefix.stripprefix.prefixes=/api/storage"
+      - "traefik.http.middlewares.storage-addaccept.headers.customrequestheaders.Accept=application/json" # Firefox Browser Support
+      - "traefik.http.services.storage.loadbalancer.server.port=3000"
+
+  storage-db:
+    image: postgres:12-alpine
+    environment:
+      POSTGRES_DB: ods
+      POSTGRES_USER: ods_admin
+      POSTGRES_PASSWORD: ods_pw
+    volumes:
+      - volume_storage_db:/var/lib/postgresql/data
+
+  storage-db-liquibase: # perform database migration on start up
+    image: docker.pkg.github.com/jvalue/open-data-service/storage-db-liquibase:latest
+    environment:
+      DATABASE_HOST: storage-db
+      DATABASE_PORT: 5432
+      DATABASE_NAME: ods
+      DATABASE_USER: ods_admin
+      DATABASE_PW: ods_pw
+      CONNECTION_RETRIES: 5
+      CONNECTION_BACKOFF_IN_SECONDS: 2
+    depends_on:
+      - storage-db
+
+  storage-swagger: # API documentation for storage service
+    image: swaggerapi/swagger-ui
+    environment:
+      API_URL: http://localhost:9400/
+
+  # ----------------- PIPELINE SERVICE (/pipelines) --------------------
+  pipeline:
+    image: docker.pkg.github.com/jvalue/open-data-service/pipeline:latest
+    depends_on:
+      - rabbitmq
+      - pipeline-db
+    environment:
+      CONNECTION_RETRIES: '30'
+      CONNECTION_BACKOFF_IN_MS: '2000'
+
+      POSTGRES_HOST: "pipeline-db"
+      POSTGRES_PORT: 5432
+      POSTGRES_USER: "pipeline-service"
+      POSTGRES_PW: "pw"
+      POSTGRES_DB: "ods-pipelines"
+      POSTGRES_SCHEMA: "public" # other schemas have to be created somewhere before use!
+
+      AMQP_URL: "amqp://rabbit_adm:R4bb!7_4DM_p4SS@rabbitmq:5672"
+      AMQP_PIPELINE_EXECUTION_EXCHANGE: 'ods_global'
+      AMQP_PIPELINE_EXECUTION_SUCCESS_TOPIC: 'pipeline.execution.success'
+      AMQP_PIPELINE_EXECUTION_ERROR_TOPIC: 'pipeline.execution.error'
+      AMQP_PIPELINE_CONFIG_CREATED_TOPIC: 'pipeline.config.created'
+      AMQP_PIPELINE_CONFIG_UPDATED_TOPIC: 'pipeline.config.updated'
+      AMQP_PIPELINE_CONFIG_DELETED_TOPIC: 'pipeline.config.deleted'
+      AMQP_DATASOURCE_EXECUTION_EXCHANGE: 'ods_global'
+      AMQP_DATASOURCE_EXECUTION_TOPIC: 'datasource.execution.*'
+      AMQP_DATASOURCE_EXECUTION_SUCCESS_TOPIC: 'datasource.execution.success'
+      AMQP_PIPELINE_EXECUTION_QUEUE: 'pipeline.pipeline-execution'
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.to-pipeline.rule=PathPrefix(`/api/pipelines`)"
+      - "traefik.http.routers.to-pipeline.middlewares=pipeline-stripprefix@docker"
+      - "traefik.http.middlewares.pipeline-stripprefix.stripprefix.prefixes=/api/pipelines"
+      - "traefik.http.services.pipeline.loadbalancer.server.port=8080"
+
+  pipeline-db:
+    image: postgres
+    environment:
+      POSTGRES_USER: 'pipeline-service'
+      POSTGRES_PASSWORD: 'pw'
+      POSTGRES_DB: 'ods-pipelines'
+    volumes:
+      - volume_pipeline_db:/var/lib/postgresql/data
+
+  # ----------------- NOTIFICATION SERVICE (/notification) --------------------
+  notification:
+    image: docker.pkg.github.com/jvalue/open-data-service/notification:latest
+    environment:
+      # Postgres connection vars
+      POSTGRES_HOST: 'notification-db'
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: 'ods-notifications'
+      POSTGRES_USER: 'notification_usr'
+      POSTGRES_PW: 'admin'
+
+      CONNECTION_RETRIES: 30
+      CONNECTION_BACKOFF_IN_MS: 2000
+
+      AMQP_URL: "amqp://rabbit_adm:R4bb!7_4DM_p4SS@rabbitmq:5672"
+      AMQP_PIPELINE_EXECUTION_EXCHANGE: 'ods_global'
+      AMQP_PIPELINE_EXECUTION_QUEUE: 'notification.pipeline-execution'
+      AMQP_PIPELINE_EXECUTION_SUCCESS_TOPIC: 'pipeline.execution.success'
+      AMQP_NOTIFICATION_QUEUE: 'NOTIF_QUEUE'
+
+      NOTIFICATION_DATA_LOCATION_URL: 'http://localhost:9000/storage'
+    depends_on:
+      - notification-db
+      - rabbitmq
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.to-notification.rule=PathPrefix(`/api/notification`)"
+      - "traefik.http.routers.to-notification.middlewares=notification-stripprefix@docker"
+      - "traefik.http.middlewares.notification-stripprefix.stripprefix.prefixes=/api/notification"
+      - "traefik.http.services.notification.loadbalancer.server.port=8080"
+
+  notification-db:
+    image: postgres
+    environment:
+      POSTGRES_USER: 'notification_usr'
+      POSTGRES_PASSWORD: 'admin'
+      POSTGRES_DB: 'ods-notifications'
+    volumes:
+      - volume_notification_db:/var/lib/postgresql/data
+
+# -------------------- EDGE SERVER (PORT 9000) -----------------------------
+  edge:
+    image: traefik:latest
+    command:
+      - --entrypoints.web.address=:80
+      - --providers.docker # enable label annotations in compose file
+      - --providers.docker.exposedByDefault=false
+      - --api.insecure # Dashboard: don't do that in production
+      # - --log.level=DEBUG
+    ports:
+      - "9000:80"     # The HTTP port
+      - "9001:8080"   # The Web UI (enabled by --api)
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock # So that Traefik can listen to the Docker events
+
+# -------------------- RABBIT-MQ -------------------------------------------
+  rabbitmq:
+    image:  rabbitmq:management
+    environment:
+      RABBITMQ_ERLANG_COOKIE: 'S0m3_R4bBi7_C0ok13'
+      RABBITMQ_DEFAULT_USER: 'rabbit_adm'
+      RABBITMQ_DEFAULT_PASS: 'R4bb!7_4DM_p4SS'
+    labels:
+        - "traefik.enable=true"
+        - "traefik.http.routers.to-amqp.rule=PathPrefix(`/api/amqp`)"
+        - "traefik.http.routers.to-amqp.middlewares=amqp-stripprefix@docker"
+        - "traefik.http.middlewares.amqp-stripprefix.stripprefix.prefixes=/api/amqp"
+        - "traefik.http.services.amqp.loadbalancer.server.port=8080"
+    ports:
+      - "15672:15672"
+      - "5672:5672"
